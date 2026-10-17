@@ -1,0 +1,104 @@
+name: Build Android ARM64
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-arm64-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      NDK_VERSION: 25.2.9519653
+      BPF2GO_CC: clang-18
+      BPF2GO_STRIP: llvm-strip-18
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install BPF toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-18 llvm-18 libelf-dev zlib1g-dev
+          chmod +x assets/bpftool
+          clang-18 --version
+          assets/bpftool version
+
+      - name: Run host unit tests
+        run: |
+          go test -count=1 -v ./... > test.log 2>&1 &
+          test_pid=$!
+          echo "Test PID: $test_pid"
+          set +e
+          wait "$test_pid"
+          result=$?
+          set -e
+          echo "Test exit code: $result"
+          tail -n 30 test.log
+          exit "$result"
+
+      - name: Install Android NDK r25c
+        run: |
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$NDK_VERSION"
+          echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+
+      - name: Generate BPF and BTF, then build Android executable
+        run: |
+          make all ANDROID_NDK_ROOT="$ANDROID_NDK_ROOT" > build.log 2>&1 &
+          build_pid=$!
+          echo "Build PID: $build_pid"
+          set +e
+          wait "$build_pid"
+          result=$?
+          set -e
+          echo "Build exit code: $result"
+          tail -n 30 build.log
+          exit "$result"
+
+      - name: Package executable
+        run: |
+          file eBPFDexDumper
+          readelf -h eBPFDexDumper
+          mkdir -p dist
+          cp eBPFDexDumper dist/
+          cp README.md README_en.md dist/
+          printf 'Commit: %s\nGo: %s\nNDK: %s\nTarget: android/arm64 (API 33)\n' \
+            "$GITHUB_SHA" "$(go version)" "$NDK_VERSION" > dist/BUILD_INFO.txt
+          tar -czf eBPFDexDumper-android-arm64.tar.gz -C dist .
+          mv eBPFDexDumper-android-arm64.tar.gz dist/
+          (cd dist && sha256sum eBPFDexDumper eBPFDexDumper-android-arm64.tar.gz > SHA256SUMS)
+
+      - name: Upload Android ARM64 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: eBPFDexDumper-android-arm64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload CI logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-logs
+          path: |
+            build.log
+            test.log
+          if-no-files-found: ignore
+          retention-days: 14
